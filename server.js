@@ -207,7 +207,7 @@ app.post('/api/create-checkout', async (req, res) => {
    ※ もし admin.html がプロジェクト直下なら下の行を調整
 ────────────────────────────────────────── */
 app.use('/admin', express.static(
-  path.join(__dirname, 'public', 'admin'),
+  path.join(__dirname, 'public'),
   { index: 'admin.html' }
 ));
 
