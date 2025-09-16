@@ -1,52 +1,75 @@
-// backend/public/admin.js
-function esc(s){ return String(s ?? "").replace(/[&<>"']/g, m=>({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[m])); }
+// public/admin.js
+(() => {
+  const $ = s => document.querySelector(s);
+  const $$ = s => [...document.querySelectorAll(s)];
 
-async function loadRows(){
-  const token  = document.getElementById('token').value.trim();
-  const status = document.getElementById('status').value;
-  const q      = document.getElementById('q').value.trim();
+  function statusClass(s){ return 'status ' + String(s||'').replace(/[^a-z_]/g,''); }
 
-  const qs = new URLSearchParams();
-  if (status && status !== 'all') qs.set('status', status);
-  if (q) qs.set('q', q);
-  qs.set('limit', '200');
-const headers = new Headers();
-  headers.set('Authorization', `Bearer ${token}`);
-  headers.set('Accept', 'application/json');
+  $('#load').addEventListener('click', async () => {
+    const token  = $('#token').value.trim();           // ← ここから送る
+    const status = $('#status').value;
+    const q      = $('#q').value.trim();
 
-  const res = await fetch(url, { headers });
-  const res = await fetch(`/api/reservations?${qs.toString()}`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {}
+    const url = new URL('/api/reservations', location.origin);
+    url.searchParams.set('limit', '200');
+    if (status) url.searchParams.set('status', status);
+    if (q)      url.searchParams.set('q', q);
+
+    try {
+      const res = await fetch(url.toString(), {
+        method: 'GET',
+        // ⚠️ "headers"（複数形）です
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(()=>'');
+        alert(`読み込み失敗: ${res.status}\n${text}`);
+        return;
+      }
+
+      const rows = await res.json();
+      const tbody = $('#tbl tbody');
+      tbody.innerHTML = rows.map(r => `
+        <tr>
+          <td>${r.id}</td>
+          <td>${r.created_at||''}</td>
+          <td>${r.salon_name||''}</td>
+          <td>${r.item||''}</td>
+          <td>${r.price||0}</td>
+          <td>${r.time_iso||''}</td>
+          <td>${r.contact_name||''}</td>
+          <td>${r.contact_email||''}</td>
+          <td>${r.contact_phone||''}</td>
+          <td class="${statusClass(r.status)}">${r.status||''}</td>
+          <td>
+            <button data-id="${r.id}" data-status="paid">paid</button>
+            <button data-id="${r.id}" data-status="reserved">reserved</button>
+            <button data-id="${r.id}" data-status="pending_online">pend</button>
+          </td>
+        </tr>
+      `).join('');
+
+      // ステータス更新ボタン
+      $$('#tbl button[data-id]').forEach(btn => {
+        btn.onclick = async () => {
+          const id = btn.dataset.id;
+          const newStatus = btn.dataset.status;
+          const r = await fetch(`/api/reservations/${id}`, {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${$('#token').value.trim()}`
+            },
+            body: JSON.stringify({ status: newStatus })
+          });
+          if (r.ok) $('#load').click();
+          else alert('更新失敗: ' + (await r.text().catch(()=>'')));
+        };
+      });
+    } catch (e) {
+      alert('通信エラー: ' + e.message);
+      console.error(e);
+    }
   });
-
-  if (!res.ok) {
-    alert(`読み込み失敗: ${res.status} ${res.statusText}`);
-    return;
-  }
-  const rows = await res.json();
-
-  const tbody = document.querySelector('#list tbody');
-  tbody.innerHTML = rows.map(r => `
-    <tr>
-      <td>${esc(r.id)}</td>
-      <td>${esc(r.time_iso || '')}</td>
-      <td>${esc(r.salon_name || '')}</td>
-      <td>${esc(r.item || '')}</td>
-      <td>${esc(r.price ?? '')}</td>
-      <td>${esc(r.reserve_time || '')}</td>
-      <td>${esc(r.contact_name || '')}</td>
-      <td>${esc(r.contact_email || '')}</td>
-      <td>${esc(r.contact_phone || '')}</td>
-      <td>${esc(r.status || '')}</td>
-      <td>-</td>
-    </tr>
-  `).join('');
-}
-
-document.addEventListener('DOMContentLoaded', () => {
-  document.getElementById('load').addEventListener('click', loadRows);
-  // Enterでも読み込めるように
-  document.getElementById('q').addEventListener('keydown', e => {
-    if(e.key === 'Enter') loadRows();
-  });
-});
+})();
