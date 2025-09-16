@@ -10,7 +10,11 @@ async function loadRows(){
   if (status && status !== 'all') qs.set('status', status);
   if (q) qs.set('q', q);
   qs.set('limit', '200');
+const headers = new Headers();
+  headers.set('Authorization', `Bearer ${token}`);
+  headers.set('Accept', 'application/json');
 
+  const res = await fetch(url, { headers });
   const res = await fetch(`/api/reservations?${qs.toString()}`, {
     headers: token ? { Authorization: `Bearer ${token}` } : {}
   });
