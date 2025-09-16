@@ -1,0 +1,97 @@
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Reservations Admin</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+    h1 { font-size: 20px; }
+    .row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+    input, select, button { padding: 8px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { border: 1px solid #ddd; padding: 8px; font-size: 13px; }
+    th { background: #f7f7f7; }
+    .status { font-weight: 600; }
+    .paid { color: #0a8; }
+    .reserved { color: #06c; }
+    .pending_online { color: #c60; }
+    .pending { color: #aa0; }
+  </style>
+</head>
+<body>
+  <h1>Reservations Admin</h1>
+  <div class="row">
+    <input id="token" placeholder="ADMIN_TOKEN" style="width: 220px" />
+    <select id="status">
+      <option value="">すべて</option>
+      <option value="paid">paid</option>
+      <option value="reserved">reserved</option>
+      <option value="pending_online">pending_online</option>
+      <option value="pending">pending</option>
+    </select>
+    <input id="q" placeholder="検索（名前・サロン・メール・電話・メニュー）" style="flex:1" />
+    <button id="load">読み込み</button>
+  </div>
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th>ID</th><th>日時</th><th>サロン</th><th>メニュー</th><th>価格</th><th>予約時間</th>
+        <th>氏名</th><th>メール</th><th>電話</th><th>ステータス</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+<script>
+const $ = sel => document.querySelector(sel);
+const $$ = sel => Array.from(document.querySelectorAll(sel));
+
+function cls(status){ return 'status ' + (status||'').replace(/[^a-z_]/g,''); }
+
+$('#load').onclick = async ()=>{
+  const token = $('#token').value.trim();
+  const status = $('#status').value;
+  const q = $('#q').value.trim();
+  const url = new URL('/api/reservations', location.origin);
+  if(status) url.searchParams.set('status', status);
+  if(q) url.searchParams.set('q', q);
+  const res = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token }});
+  if(!res.ok){ alert('読み込み失敗: ' + res.status); return; }
+  const rows = await res.json();
+  const tbody = $('#tbl tbody');
+  tbody.innerHTML = '';
+  for(const r of rows){
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${r.id}</td><td>${r.created_at||''}</td><td>${r.salon_name||''}</td>
+      <td>${r.item||''}</td><td>${r.price||0}</td><td>${r.time_iso||''}</td>
+      <td>${r.contact_name||''}</td><td>${r.contact_email||''}</td><td>${r.contact_phone||''}</td>
+      <td class="${cls(r.status)}">${r.status||''}</td>
+      <td>
+        <button data-id="${r.id}" data-status="paid">paid</button>
+        <button data-id="${r.id}" data-status="reserved">reserved</button>
+        <button data-id="${r.id}" data-status="pending_online">pend</button>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  }
+  $$('#tbl button[data-id]').forEach(btn=>{
+    btn.onclick = async ()=>{
+      const token = $('#token').value.trim();
+      const id = btn.getAttribute('data-id');
+      const status = btn.getAttribute('data-status');
+      const res = await fetch('/api/reservations/' + id, {
+        method: 'PATCH',
+        headers: { 'Content-Type':'application/json', 'Authorization': 'Bearer ' + token },
+        body: JSON.stringify({ status })
+      });
+      if(res.ok) $('#load').click();
+      else alert('更新失敗');
+    };
+  });
+};
+</script>
+</body>
+</html>
