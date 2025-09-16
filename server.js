@@ -206,7 +206,11 @@ app.post('/api/create-checkout', async (req, res) => {
    Admin UI 静的配信（admin.html を public 配下に置いた場合）
    ※ もし admin.html がプロジェクト直下なら下の行を調整
 ────────────────────────────────────────── */
-app.use('/admin', express.static(path.join(__dirname, 'public')));
+app.use('/admin', express.static(
+  path.join(__dirname, 'public', 'admin'),
+  { index: 'admin.html' }
+));
+
 // 例: 直下に admin.html があるなら次の1行でもOK
 // app.get('/admin', (_req, res)=> res.sendFile(path.join(__dirname, 'admin.html')));
 
