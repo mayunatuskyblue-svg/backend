@@ -222,6 +222,112 @@ app.use(
 /* ─────────────────────────────────────────
    Start
 ────────────────────────────────────────── */
+/* ─────────────────────────────────────────
+   SmartPay Admin 用 追加API
+   - 簡易ログイン(A案)
+   - サロン別カタログ
+   - 保存済みカードへの課金
+────────────────────────────────────────── */
+
+// A) サロン定義（最初はハードコード。あとでDB/Sheetに移行可）
+const SALONS = {
+  "salon01": { name: "Beauty Lanka Colombo", password: "abc123", taxRate: 18, serviceRate: 10 },
+  "salon02": { name: "Spa Paradise Kandy",   password: "xyz789", taxRate: 15, serviceRate: 12 }
+};
+
+// B) サロン別カタログ
+const CATALOGS = {
+  "salon01": {
+    menus: [
+      { id: "M_BASIC", name: "Basic Treatment", price: 5000 },
+      { id: "M_PREMIUM", name: "Premium Treatment", price: 9000 }
+    ],
+    addons: [
+      { id: "A_EXT30", name: "Extend 30 min", price: 2000 },
+      { id: "A_AROMA", name: "Aroma Oil",     price: 1500 }
+    ],
+    discounts: [
+      { id: "D_10P", type: "percent", value: 10, name: "10% OFF" },
+      { id: "D_500", type: "flat",    value: 500, name: "LKR 500 OFF" }
+    ],
+  },
+  "salon02": {
+    menus: [
+      { id: "M_STD", name: "Standard Spa", price: 7000 },
+      { id: "M_LUX", name: "Luxury Spa",   price: 12000 }
+    ],
+    addons: [
+      { id: "A_SCRUB", name: "Body Scrub", price: 2500 },
+      { id: "A_MASK",  name: "Herb Mask",  price: 1800 }
+    ],
+    discounts: [
+      { id: "D_5P", type: "percent", value: 5, name: "5% OFF" },
+      { id: "D_800", type: "flat",   value: 800, name: "LKR 800 OFF" }
+    ],
+  }
+};
+
+// C) 予約(bookingId) → Stripe 顧客/支払い手段 のひも付け（初期は手動で）
+const BOOKING_TO_STRIPE = {
+  // 例）予約 BOOK_001 は、保存済みカードを持つ Stripe 顧客に紐付いている
+  // 顧客ID: cus_xxx、保存済みPM: pm_xxx（SetupIntent で事前に保存しておく）
+  "BOOK_001": { stripeCustomerId: "cus_XXXXXXXXXXXX", defaultPaymentMethod: "pm_XXXXXXXXXXXX" }
+};
+
+// 1) 簡易ログイン
+app.post("/api/auth/login", (req, res) => {
+  const { salonId, password } = req.body || {};
+  const s = SALONS[salonId];
+  if (!s || s.password !== String(password || "")) {
+    return res.status(401).json({ ok:false, error:"invalid credentials" });
+  }
+  return res.json({ ok:true, salon: { id: salonId, name: s.name } });
+});
+
+// 2) サロン別カタログ取得
+app.get("/api/catalog", (req, res) => {
+  const salonId = String(req.query.salonId || "");
+  const s = SALONS[salonId];
+  if (!s) return res.status(404).json({ error: "unknown salonId" });
+  const cat = CATALOGS[salonId] || { menus:[], addons:[], discounts:[] };
+  res.json({ ...cat, taxRate: s.taxRate, serviceRate: s.serviceRate });
+});
+
+// 3) 課金（保存済みカードに off_session で確定）
+app.post("/api/charge", async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ ok:false, error:"Stripe not configured" });
+
+    const { salonId, bookingId, amountLKR, approvalId } = req.body || {};
+    if (!salonId || !bookingId || !amountLKR) {
+      return res.status(400).json({ ok:false, error:"missing fields" });
+    }
+
+    // 予約→Stripe顧客/PM の取得
+    const link = BOOKING_TO_STRIPE[String(bookingId)];
+    if (!link || !link.stripeCustomerId || !link.defaultPaymentMethod) {
+      return res.status(400).json({ ok:false, error:"customer has no saved card" });
+    }
+
+    const amount = Math.round(Number(amountLKR)); // LKRは整数
+    const pi = await stripe.paymentIntents.create({
+      amount,
+      currency: "lkr",
+      customer: link.stripeCustomerId,
+      payment_method: link.defaultPaymentMethod,
+      confirm: true,
+      off_session: true,
+      description: `SmartPay charge for booking ${bookingId} (${salonId})`,
+      // metadata: { approvalId } // 追跡したいなら
+    });
+
+    res.json({ ok:true, paymentIntentId: pi.id, status: pi.status });
+  } catch (e) {
+    console.error("charge error:", e);
+    res.status(400).json({ ok:false, error: e.message, code: e.code, pi: e.payment_intent?.id });
+  }
+});
+
 const PORT = process.env.PORT || 8787;
 app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
