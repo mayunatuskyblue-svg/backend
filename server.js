@@ -1,3 +1,4 @@
+// server.js (ESM統一・Webhook重複解消版)
 import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -17,11 +18,19 @@ const __dirname = path.dirname(__filename);
 const app = express();
 
 /* ─────────────────────────────────────────
-   Stripe setup（最初にまとめる）
+   Stripe setup
 ────────────────────────────────────────── */
 const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 const stripe = STRIPE_SECRET ? new Stripe(STRIPE_SECRET) : null;
+
+/* ─────────────────────────────────────────
+   DB setup（Webhookからも使うため先に初期化）
+────────────────────────────────────────── */
+const dbPath = path.join(__dirname, 'data');
+if (!fs.existsSync(dbPath)) fs.mkdirSync(dbPath, { recursive: true });
+const db = new Database(path.join(dbPath, 'app.db'));
+db.migrate();
 
 /* ─────────────────────────────────────────
    Middleware（セキュリティ・ログ）
@@ -32,11 +41,12 @@ app.use(morgan('dev'));
 
 /* ─────────────────────────────────────────
    Webhook（必ず json パーサより前・rawで受ける）
+   ※ ここを唯一のWebhookにする（/webhook/stripe）
 ────────────────────────────────────────── */
 app.post('/webhook/stripe', express.raw({ type: 'application/json' }), (req, res) => {
   if (!stripe) return res.status(500).send('Stripe not configured');
-  let event = req.body; // raw のまま
 
+  let event = req.body; // raw Buffer
   if (STRIPE_WEBHOOK_SECRET) {
     const sig = req.headers['stripe-signature'];
     try {
@@ -45,18 +55,47 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), (req, res
       console.error('Webhook signature verification failed:', err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
+  } else {
+    // 開発用途：署名検証を省略（本番は必ず STRIPE_WEBHOOK_SECRET を設定）
+    try {
+      event = JSON.parse(req.body);
+    } catch {
+      // noop: event はそのまま（stripe listen 利用時は constructEvent が必要）
+    }
   }
 
   // 必要イベントのみ処理
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const reservationId =
-      session.client_reference_id ||
-      (session.metadata && session.metadata.reservation_id);
-
-    if (reservationId) {
-      db.updateReservationStatus(reservationId, 'paid');
-      db.attachPaymentIntent(reservationId, session.payment_intent || '');
+  switch (event.type) {
+    case 'checkout.session.completed': {
+      const session = event.data.object;
+      const reservationId =
+        session.client_reference_id ||
+        (session.metadata && session.metadata.reservation_id);
+      if (reservationId) {
+        try {
+          db.updateReservationStatus(reservationId, 'paid');
+          db.attachPaymentIntent(reservationId, session.payment_intent || '');
+        } catch (e) {
+          console.error('DB update error in webhook:', e);
+        }
+      }
+      break;
+    }
+    case 'setup_intent.succeeded': {
+      const si = event.data.object;
+      console.log('Setup succeeded:', si.id, si.payment_method);
+      // 例：si.metadata.bookingId を使って BOOKING_TO_STRIPE を更新するならここで対応
+      break;
+    }
+    case 'payment_intent.succeeded': {
+      const pi = event.data.object;
+      console.log('Payment succeeded:', pi.id);
+      break;
+    }
+    case 'payment_intent.payment_failed': {
+      const pi = event.data.object;
+      console.log('Payment failed:', pi.id, pi.last_payment_error?.message);
+      break;
     }
   }
 
@@ -70,18 +109,9 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 /* ─────────────────────────────────────────
-   DB setup
-────────────────────────────────────────── */
-const dbPath = path.join(__dirname, 'data');
-if (!fs.existsSync(dbPath)) fs.mkdirSync(dbPath, { recursive: true });
-const db = new Database(path.join(dbPath, 'app.db'));
-db.migrate();
-
-/* ─────────────────────────────────────────
-   管理系
+   管理系（トークン保護）
 ────────────────────────────────────────── */
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'change-me';
-
 function requireAdmin(req, res, next) {
   const auth = req.headers.authorization || '';
   if (!auth.startsWith('Bearer ')) return res.status(401).json({ error: 'No token' });
@@ -96,7 +126,7 @@ function requireAdmin(req, res, next) {
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 /* ─────────────────────────────────────────
-   予約API
+   予約API（例）
 ────────────────────────────────────────── */
 app.post('/api/reservations', (req, res) => {
   const {
@@ -145,84 +175,6 @@ app.patch('/api/reservations/:id', requireAdmin, (req, res) => {
 });
 
 /* ─────────────────────────────────────────
-   Stripe Checkout セッション作成
-   ※ JPY は最小通貨単位が 0 桁
-────────────────────────────────────────── */
-app.post('/api/create-checkout', async (req, res) => {
-  try {
-    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
-
-    const {
-      reservationId,
-      item,
-      price,
-      currency = 'usd',
-      successBaseUrl,
-      cancelBaseUrl
-    } = req.body || {};
-
-    if (!reservationId || !item) {
-      return res.status(400).json({ error: 'reservationId and item required' });
-    }
-
-    const nPrice = Number(price || 0);
-    const unit_amount =
-      String(currency).toLowerCase() === 'jpy'
-        ? Math.round(nPrice)             // JPY: そのまま整数円
-        : Math.round(nPrice * 100);      // USD/LKR: セント
-
-    const base = successBaseUrl || `${req.protocol}://${req.get('host')}`;
-    const success_url = `${base}/thankyou.html?reservationId=${encodeURIComponent(reservationId)}`;
-    const cancel_url  = `${cancelBaseUrl || base}/confirm.html?reservationId=${encodeURIComponent(reservationId)}`;
-
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      line_items: [{
-        price_data: {
-          currency,
-          product_data: { name: item },
-          unit_amount,
-        },
-        quantity: 1
-      }],
-      success_url,
-      cancel_url,
-      client_reference_id: String(reservationId),
-      metadata: {
-        reservation_id: String(reservationId),
-        item: String(item)
-      }
-    });
-
-    db.attachStripeSession(reservationId, session.id);
-    return res.json({ url: session.url });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Failed to create checkout' });
-  }
-});
-
-/* ─────────────────────────────────────────
-   Admin UI 静的配信（admin.html を public 配下に置いた場合）
-   ※ もし admin.html がプロジェクト直下なら下の行を調整
-────────────────────────────────────────── */
-// Admin UI
-app.use(
-  '/admin',
-  express.static(
-    path.join(__dirname, 'public'),
-    { index: 'admin.html' }   // 👈 これを追加
-  )
-);
-
-
-// 例: 直下に admin.html があるなら次の1行でもOK
-// app.get('/admin', (_req, res)=> res.sendFile(path.join(__dirname, 'admin.html')));
-
-/* ─────────────────────────────────────────
-   Start
-────────────────────────────────────────── */
-/* ─────────────────────────────────────────
    SmartPay Admin 用 追加API
    - 簡易ログイン(A案)
    - サロン別カタログ
@@ -267,10 +219,8 @@ const CATALOGS = {
   }
 };
 
-// C) 予約(bookingId) → Stripe 顧客/支払い手段 のひも付け（初期は手動で）
+// C) 予約(bookingId) → Stripe 顧客/保存PM（初期は手動で）
 const BOOKING_TO_STRIPE = {
-  // 例）予約 BOOK_001 は、保存済みカードを持つ Stripe 顧客に紐付いている
-  // 顧客ID: cus_xxx、保存済みPM: pm_xxx（SetupIntent で事前に保存しておく）
   "BOOK_001": { stripeCustomerId: "cus_XXXXXXXXXXXX", defaultPaymentMethod: "pm_XXXXXXXXXXXX" }
 };
 
@@ -303,13 +253,12 @@ app.post("/api/charge", async (req, res) => {
       return res.status(400).json({ ok:false, error:"missing fields" });
     }
 
-    // 予約→Stripe顧客/PM の取得
     const link = BOOKING_TO_STRIPE[String(bookingId)];
     if (!link || !link.stripeCustomerId || !link.defaultPaymentMethod) {
       return res.status(400).json({ ok:false, error:"customer has no saved card" });
     }
 
-    const amount = Math.round(Number(amountLKR)); // LKRは整数
+    const amount = Math.round(Number(amountLKR)); // LKRは整数単位
     const pi = await stripe.paymentIntents.create({
       amount,
       currency: "lkr",
@@ -318,7 +267,7 @@ app.post("/api/charge", async (req, res) => {
       confirm: true,
       off_session: true,
       description: `SmartPay charge for booking ${bookingId} (${salonId})`,
-      // metadata: { approvalId } // 追跡したいなら
+      // metadata: { approvalId }
     });
 
     res.json({ ok:true, paymentIntentId: pi.id, status: pi.status });
@@ -327,120 +276,64 @@ app.post("/api/charge", async (req, res) => {
     res.status(400).json({ ok:false, error: e.message, code: e.code, pi: e.payment_intent?.id });
   }
 });
-/* === 保存カード 登録フロー (SetupIntent) ======================= */
-/*
-  使い方（簡易）：
-  1) /api/customer/upsert で顧客(bookingId)⇔stripeCustomer をひも付け
-  2) /api/setup/start で SetupIntent を作成 → client_secret をフロントへ返す
-  3) フロントで Stripe.js を使い、confirmCardSetup() でカード入力＆保存
-*/
 
-const { v4: uuidv4 } = require("uuid");
-
-// 既存: BOOKING_TO_STRIPE を使っているので、ここに保存していく（初期はメモリ保持）
-function upsertBookingLink(bookingId, stripeCustomerId, defaultPaymentMethod) {
-  BOOKING_TO_STRIPE[bookingId] = { stripeCustomerId, defaultPaymentMethod: defaultPaymentMethod || null };
-  return BOOKING_TO_STRIPE[bookingId];
-}
-
-// 1) 顧客作成/取得（bookingIdとメール・名前などでひも付け）
-app.post("/api/customer/upsert", async (req, res) => {
+/* ─────────────────────────────────────────
+   Checkout（例：既存機能）
+────────────────────────────────────────── */
+app.post('/api/create-checkout', async (req, res) => {
   try {
-    const { bookingId, email, name } = req.body || {};
-    if (!bookingId) return res.status(400).json({ ok:false, error:"bookingId required" });
-    if (!stripe) return res.status(500).json({ ok:false, error:"Stripe not configured" });
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
 
-    // 既にリンクがあればそのまま返す
-    const existed = BOOKING_TO_STRIPE[bookingId];
-    if (existed?.stripeCustomerId) {
-      const cus = await stripe.customers.retrieve(existed.stripeCustomerId);
-      return res.json({ ok:true, customerId: cus.id });
+    const {
+      reservationId, item, price,
+      currency = 'usd',
+      successBaseUrl, cancelBaseUrl
+    } = req.body || {};
+
+    if (!reservationId || !item) {
+      return res.status(400).json({ error: 'reservationId and item required' });
     }
 
-    // 新規 Customer
-    const cus = await stripe.customers.create({
-      email: email || undefined,
-      name: name || undefined,
-      metadata: { bookingId }
+    const nPrice = Number(price || 0);
+    const unit_amount =
+      String(currency).toLowerCase() === 'jpy'
+        ? Math.round(nPrice)
+        : Math.round(nPrice * 100);
+
+    const base = successBaseUrl || `${req.protocol}://${req.get('host')}`;
+    const success_url = `${base}/thankyou.html?reservationId=${encodeURIComponent(reservationId)}`;
+    const cancel_url  = `${cancelBaseUrl || base}/confirm.html?reservationId=${encodeURIComponent(reservationId)}`;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [{
+        price_data: { currency, product_data: { name: item }, unit_amount },
+        quantity: 1
+      }],
+      success_url,
+      cancel_url,
+      client_reference_id: String(reservationId),
+      metadata: { reservation_id: String(reservationId), item: String(item) }
     });
 
-    upsertBookingLink(bookingId, cus.id, null);
-    return res.json({ ok:true, customerId: cus.id });
-  } catch(e) {
-    console.error(e);
-    res.status(400).json({ ok:false, error:e.message });
-  }
-});
-
-// 2) SetupIntent を開始（client_secret を返す）
-app.post("/api/setup/start", async (req, res) => {
-  try {
-    const { bookingId } = req.body || {};
-    if (!bookingId) return res.status(400).json({ ok:false, error:"bookingId required" });
-    if (!stripe) return res.status(500).json({ ok:false, error:"Stripe not configured" });
-
-    const link = BOOKING_TO_STRIPE[bookingId];
-    if (!link?.stripeCustomerId) return res.status(400).json({ ok:false, error:"customer not linked" });
-
-    const si = await stripe.setupIntents.create({
-      customer: link.stripeCustomerId,
-      usage: "off_session",
-      payment_method_types: ["card"],
-      metadata: { bookingId }
-    });
-
-    res.json({ ok:true, client_secret: si.client_secret, setupIntentId: si.id });
-  } catch(e) {
-    console.error(e);
-    res.status(400).json({ ok:false, error:e.message });
-  }
-});
-
-// 3) Webhook で「保存完了」や「支払い完了」を最終確定（下のステップ3で本体を作る）
-const bodyParser = require("body-parser");
-
-// Webhook は raw ボディで受ける
-app.post("/stripe/webhook", bodyParser.raw({type: "application/json"}), (req, res) => {
-  const sig = req.headers["stripe-signature"];
-  const whSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  let event;
-
-  try {
-    if (whSecret) {
-      event = Stripe(process.env.STRIPE_SECRET_KEY).webhooks.constructEvent(req.body, sig, whSecret);
-    } else {
-      // 開発中は検証を省略（本番は必ず whSecret を設定！）
-      event = JSON.parse(req.body);
-    }
+    db.attachStripeSession(reservationId, session.id);
+    return res.json({ url: session.url });
   } catch (err) {
-    console.error("Webhook signature verification failed.", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to create checkout' });
   }
-
-  // 必要なイベントだけ拾う
-  switch (event.type) {
-    case "setup_intent.succeeded": {
-      const si = event.data.object;
-      // si.customer, si.payment_method を BOOKING_TO_STRIPE に反映させたい場合、
-      // si.metadata.bookingId を参照して保存
-      console.log("Setup succeeded:", si.id, si.payment_method);
-      break;
-    }
-    case "payment_intent.succeeded": {
-      const pi = event.data.object;
-      console.log("Payment succeeded:", pi.id);
-      break;
-    }
-    case "payment_intent.payment_failed": {
-      const pi = event.data.object;
-      console.log("Payment failed:", pi.id, pi.last_payment_error?.message);
-      break;
-    }
-  }
-
-  res.json({received: true});
 });
 
+/* ─────────────────────────────────────────
+   Admin UI 静的配信（public/admin.html を配信）
+────────────────────────────────────────── */
+app.use('/admin', express.static(path.join(__dirname, 'public'), { index: 'admin.html' }));
+// 直下に admin.html がある場合はこちらでもOK
+// app.get('/admin', (_req, res)=> res.sendFile(path.join(__dirname, 'admin.html')));
+
+/* ─────────────────────────────────────────
+   Start
+────────────────────────────────────────── */
 const PORT = process.env.PORT || 8787;
 app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
