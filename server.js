@@ -397,6 +397,49 @@ app.post("/api/setup/start", async (req, res) => {
 });
 
 // 3) Webhook で「保存完了」や「支払い完了」を最終確定（下のステップ3で本体を作る）
+const bodyParser = require("body-parser");
+
+// Webhook は raw ボディで受ける
+app.post("/stripe/webhook", bodyParser.raw({type: "application/json"}), (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  const whSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  let event;
+
+  try {
+    if (whSecret) {
+      event = Stripe(process.env.STRIPE_SECRET_KEY).webhooks.constructEvent(req.body, sig, whSecret);
+    } else {
+      // 開発中は検証を省略（本番は必ず whSecret を設定！）
+      event = JSON.parse(req.body);
+    }
+  } catch (err) {
+    console.error("Webhook signature verification failed.", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // 必要なイベントだけ拾う
+  switch (event.type) {
+    case "setup_intent.succeeded": {
+      const si = event.data.object;
+      // si.customer, si.payment_method を BOOKING_TO_STRIPE に反映させたい場合、
+      // si.metadata.bookingId を参照して保存
+      console.log("Setup succeeded:", si.id, si.payment_method);
+      break;
+    }
+    case "payment_intent.succeeded": {
+      const pi = event.data.object;
+      console.log("Payment succeeded:", pi.id);
+      break;
+    }
+    case "payment_intent.payment_failed": {
+      const pi = event.data.object;
+      console.log("Payment failed:", pi.id, pi.last_payment_error?.message);
+      break;
+    }
+  }
+
+  res.json({received: true});
+});
 
 const PORT = process.env.PORT || 8787;
 app.listen(PORT, () => {
