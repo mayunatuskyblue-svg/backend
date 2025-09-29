@@ -327,6 +327,76 @@ app.post("/api/charge", async (req, res) => {
     res.status(400).json({ ok:false, error: e.message, code: e.code, pi: e.payment_intent?.id });
   }
 });
+/* === 保存カード 登録フロー (SetupIntent) ======================= */
+/*
+  使い方（簡易）：
+  1) /api/customer/upsert で顧客(bookingId)⇔stripeCustomer をひも付け
+  2) /api/setup/start で SetupIntent を作成 → client_secret をフロントへ返す
+  3) フロントで Stripe.js を使い、confirmCardSetup() でカード入力＆保存
+*/
+
+const { v4: uuidv4 } = require("uuid");
+
+// 既存: BOOKING_TO_STRIPE を使っているので、ここに保存していく（初期はメモリ保持）
+function upsertBookingLink(bookingId, stripeCustomerId, defaultPaymentMethod) {
+  BOOKING_TO_STRIPE[bookingId] = { stripeCustomerId, defaultPaymentMethod: defaultPaymentMethod || null };
+  return BOOKING_TO_STRIPE[bookingId];
+}
+
+// 1) 顧客作成/取得（bookingIdとメール・名前などでひも付け）
+app.post("/api/customer/upsert", async (req, res) => {
+  try {
+    const { bookingId, email, name } = req.body || {};
+    if (!bookingId) return res.status(400).json({ ok:false, error:"bookingId required" });
+    if (!stripe) return res.status(500).json({ ok:false, error:"Stripe not configured" });
+
+    // 既にリンクがあればそのまま返す
+    const existed = BOOKING_TO_STRIPE[bookingId];
+    if (existed?.stripeCustomerId) {
+      const cus = await stripe.customers.retrieve(existed.stripeCustomerId);
+      return res.json({ ok:true, customerId: cus.id });
+    }
+
+    // 新規 Customer
+    const cus = await stripe.customers.create({
+      email: email || undefined,
+      name: name || undefined,
+      metadata: { bookingId }
+    });
+
+    upsertBookingLink(bookingId, cus.id, null);
+    return res.json({ ok:true, customerId: cus.id });
+  } catch(e) {
+    console.error(e);
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+// 2) SetupIntent を開始（client_secret を返す）
+app.post("/api/setup/start", async (req, res) => {
+  try {
+    const { bookingId } = req.body || {};
+    if (!bookingId) return res.status(400).json({ ok:false, error:"bookingId required" });
+    if (!stripe) return res.status(500).json({ ok:false, error:"Stripe not configured" });
+
+    const link = BOOKING_TO_STRIPE[bookingId];
+    if (!link?.stripeCustomerId) return res.status(400).json({ ok:false, error:"customer not linked" });
+
+    const si = await stripe.setupIntents.create({
+      customer: link.stripeCustomerId,
+      usage: "off_session",
+      payment_method_types: ["card"],
+      metadata: { bookingId }
+    });
+
+    res.json({ ok:true, client_secret: si.client_secret, setupIntentId: si.id });
+  } catch(e) {
+    console.error(e);
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+// 3) Webhook で「保存完了」や「支払い完了」を最終確定（下のステップ3で本体を作る）
 
 const PORT = process.env.PORT || 8787;
 app.listen(PORT, () => {
