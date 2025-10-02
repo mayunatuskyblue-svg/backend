@@ -36,7 +36,25 @@ db.migrate();
    Middleware（セキュリティ・ログ）
 ────────────────────────────────────────── */
 app.use(helmet());
-app.use(cors({ origin: true, credentials: false }));
+// CORS設定（beautylk.com からのリクエストだけ許可）
+const allowlist = [
+  "https://beautylk.com",
+  "https://www.beautylk.com",
+  "http://localhost:5500",   // ← 開発でローカル確認するとき用
+  "http://127.0.0.1:5500"
+];
+
+app.use(cors({
+  origin: function (origin, cb) {
+    if (!origin) return cb(null, true);            // curlや同一オリジン時は許可
+    cb(null, allowlist.includes(origin));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Stripe-Signature"]
+}));
+
+// OPTIONSリクエスト（プリフライト）も必ず応答
+app.options("*", cors());
 app.use(morgan('dev'));
 
 /* ─────────────────────────────────────────
